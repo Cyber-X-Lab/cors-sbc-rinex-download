@@ -82,19 +82,19 @@ class XposClient:
             sys.exit(f"STOP: station {station_code!r} not found in Xpos site list")
         return matches[0]["siteId"]
 
-    def preview(self, site_id, start_iso, end_iso, rate_ms):
+    def preview(self, site_id, start_utc, end_utc, rate_ms):
         """Metadata only -- queues no job and downloads nothing."""
         r = self.s.get(self.api + f"rinex/zulu/preview/{site_id}",
-                       params={"startTime": start_iso, "endTime": end_iso,
+                       params={"startTime": start_utc, "endTime": end_utc,
                                "concatenate": "true",
                                "observationRate": rate_ms},
                        timeout=60)
         return self._check(r).json()
 
-    def request(self, site_ids, start_iso, end_iso, rate_ms, name):
+    def request(self, site_ids, start_utc, end_utc, rate_ms, name):
         r = self.s.post(self.api + "rinex/zulu/all",
-                        params={"name": name, "startTime": start_iso,
-                                "endTime": end_iso, "concatenate": "true",
+                        params={"name": name, "startTime": start_utc,
+                                "endTime": end_utc, "concatenate": "true",
                                 "observationRate": rate_ms,
                                 "sendNotifications": "false"},
                         json=list(site_ids), timeout=120)
@@ -140,13 +140,20 @@ class XposClient:
             sys.exit(f"STOP: download of fileId {file_id} returned 0 bytes")
         return nbytes
 
-    def fetch(self, site_ids, start_iso, end_iso, rate_ms, name, dest_dir,
+    def fetch(self, site_ids, start_utc, end_utc, rate_ms, name, dest_dir,
               wait_s=600):
         """One request over [start,end], download every result file into
         dest_dir; return the local file paths."""
+        # The server accepts a request for a window it holds no data for, then
+        # silently drops it, so wait_finished would only time out. The preview
+        # is free and says so up front.
+        if not any(self.preview(sid, start_utc, end_utc, rate_ms).get("epochs")
+                   for sid in site_ids):
+            sys.exit(f"STOP: no data on server for {start_utc} .. {end_utc} "
+                     f"at {rate_ms / 1000:g}s")
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        self.request(site_ids, start_iso, end_iso, rate_ms, name)
+        self.request(site_ids, start_utc, end_utc, rate_ms, name)
         req = self.wait_finished(name, timeout_s=wait_s)
         detail = self._check(self.s.get(
             self.api + f"rinexrequest/{req['requestId']}", timeout=30)).json()
@@ -262,24 +269,39 @@ def concat_rinex(paths, out_path, kind):
 
 
 # ===========================================================================
-# Day pulling
+# UTC times
 # ===========================================================================
-def iso(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+def parse_utc(s):
+    """'YYYY-MM-DD[THH:MM[:SS]][Z]' -> aware UTC datetime. A time without an
+    offset is taken as UTC; one with an offset is converted."""
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def day_windows(day, split_hours):
-    """[(start_iso, end_iso), ...] covering the full UTC day."""
-    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-    end = start + timedelta(days=1)
+def format_utc(dt):
+    """Aware datetime -> 'YYYY-MM-DDTHH:MM:SSZ', the form the API takes."""
+    if dt.tzinfo is None:
+        raise ValueError(f"naive datetime {dt} — give it a timezone")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ===========================================================================
+# Window pulling
+# ===========================================================================
+
+def split_windows(start, end, split_hours):
+    """[(start_utc, end_utc), ...] covering [start, end] in split_hours pieces
+    (one piece if split_hours is 0)."""
     if split_hours and split_hours > 0:
         edges, t = [], start
         while t < end:
             nxt = min(t + timedelta(hours=split_hours), end)
             edges.append((t, nxt))
             t = nxt
-        return [(iso(s), iso(e)) for s, e in edges]
-    return [(iso(start), iso(end))]
+        return [(format_utc(s), format_utc(e)) for s, e in edges]
+    return [(format_utc(start), format_utc(end))]
 
 
 def unzip(zip_path, dest):
@@ -304,23 +326,22 @@ def count_obs_epochs(path):
     return n
 
 
-def pull_day(client, code, sid, day, rate_ms, split_hours, out_root,
-             wait_s=600):
-    """Pull one full UTC day for one station into out_root/day_YYYYMMDD/<CODE>/.
-    Sub-windows are unzipped and stitched per RINEX file type.
-    Returns (obs_epochs, expected_epochs)."""
-    site_dir = Path(out_root) / f"day_{day:%Y%m%d}" / code
-    site_dir.mkdir(parents=True, exist_ok=True)
-    windows = day_windows(day, split_hours)
-    expected = round(86400 / (rate_ms / 1000))
+def pull_window(client, code, sid, start, end, rate_ms, split_hours, site_dir,
+                tag, wait_s=600):
+    """Pull [start, end] (aware UTC datetimes) for one station into site_dir.
+    Sub-windows are unzipped and stitched per RINEX file type; `tag` names the
+    server requests. Returns (obs_epochs, expected_epochs)."""
+    site_dir = Path(site_dir)
+    windows = split_windows(start, end, split_hours)
+    expected = round((end - start).total_seconds() / (rate_ms / 1000))
     tmp = Path(tempfile.mkdtemp(prefix=f"pull-{code}-"))
     obs_epochs = 0
     try:
         by_ext = defaultdict(list)       # ".26o" -> paths in chronological order
-        for i, (s_iso, e_iso) in enumerate(windows):
-            name = f"cors-al50-{code}-{day:%Y%m%d}-w{i}"
-            print(f"  [{i+1}/{len(windows)}] {s_iso} .. {e_iso}", flush=True)
-            zips = client.fetch([sid], s_iso, e_iso, rate_ms, name,
+        for i, (s_utc, e_utc) in enumerate(windows):
+            name = f"cors-al50-{code}-{tag}-w{i}"
+            print(f"  [{i+1}/{len(windows)}] {s_utc} .. {e_utc}", flush=True)
+            zips = client.fetch([sid], s_utc, e_utc, rate_ms, name,
                                 tmp / f"w{i}", wait_s=wait_s)
             for z in zips:
                 for p in unzip(z, tmp / f"w{i}" / "ex"):
@@ -336,3 +357,13 @@ def pull_day(client, code, sid, day, rate_ms, split_hours, out_root,
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return obs_epochs, expected
+
+
+def pull_day(client, code, sid, day, rate_ms, split_hours, out_root,
+             wait_s=600):
+    """Pull one full UTC day into out_root/day_YYYYMMDD/<CODE>/."""
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    return pull_window(client, code, sid, start, start + timedelta(days=1),
+                       rate_ms, split_hours,
+                       Path(out_root) / f"day_{day:%Y%m%d}" / code,
+                       f"{day:%Y%m%d}", wait_s=wait_s)
